@@ -1,7 +1,7 @@
 /* Creative Commons CC0 Public Domain. To the extent possible under law, Jakub Boksansky has waived all copyright and related or neighboring rights to Crash Course in BRDF Implementation Code Sample. This work is published from: Germany. */
 
 // This is a code sample accompanying the "Crash Course in BRDF Implementation" article
-// v1.1, February 2021
+// v1.2, August 2023
 
 // -------------------------------------------------------------------------
 //    C++ compatibility
@@ -18,14 +18,20 @@
 #include "glm/glm/gtx/compatibility.hpp"
 
 #define OUT_PARAMETER(X) X&
+#define FUNCTION static
 
 using namespace glm;
 
+namespace brdf {
+
 inline float rsqrt(float x) { return inversesqrt(x); }
 inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
+inline float2 mul(float2x2 a, float2 b) { return b * a; }
+inline float3 mul(float3x3 a, float3 b) { return b * a; }
 
 #else
 #define OUT_PARAMETER(X) out X
+#define FUNCTION 
 #endif
 
 // -------------------------------------------------------------------------
@@ -96,7 +102,11 @@ inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
 
 // Specifies minimal reflectance for dielectrics (when metalness is zero)
 // Nothing has lower reflectance than 2%, but we use 4% to have consistent results with UE4, Frostbite, et al.
+// Note: only takes effect when USE_REFLECTANCE_PARAMETER is not defined
 #define MIN_DIELECTRICS_F0 0.04f
+
+// Define this to use minimal reflectance (F0) specified per material, instead of global MIN_DIELECTRICS_F0 value
+//#define USE_REFLECTANCE_PARAMETER 1
 
 // Enable this to weigh diffuse by Fresnel too, otherwise specular and diffuse will be simply added together
 // (this is disabled by default for Frostbite diffuse which is normalized to combine well with GGX Specular BRDF)
@@ -112,6 +122,12 @@ inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
 
 // Enable height correlated version of G2 term. Separable version will be used otherwise
 #define USE_HEIGHT_CORRELATED_G2 1
+
+// Enable this to use Walter's sampling for GG-X distribution instead of more recent VNDF
+//#define USE_WALTER_GGX_SAMPLING 1
+
+// Enable this to VNDF sampling using spherical caps instead of original Heitz's method
+//#define USE_VNDF_WITH_SPHERICAL_CAPS 1
 
 // -------------------------------------------------------------------------
 //    Automatically resolved macros based on preferences (don't edit these)
@@ -145,7 +161,11 @@ inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
 #define evalSpecular evalMicrofacet
 #define sampleSpecular sampleSpecularMicrofacet
 #if MICROFACET_DISTRIBUTION == GGX
+#if USE_WALTER_GGX_SAMPLING
+#define sampleSpecularHalfVector sampleGGXWalter
+#else
 #define sampleSpecularHalfVector sampleGGXVNDF
+#endif
 #else
 #define sampleSpecularHalfVector sampleBeckmannWalter
 #endif
@@ -160,11 +180,19 @@ inline float saturate(float x) { return clamp(x, 0.0f, 1.0f); }
 #endif
 
 #if MICROFACET_DISTRIBUTION == GGX
+#if USE_WALTER_GGX_SAMPLING
+#define specularSampleWeight specularSampleWeightGGXWalter
+#else
 #define specularSampleWeight specularSampleWeightGGXVNDF
+#endif
+#if USE_WALTER_GGX_SAMPLING
+#define specularPdf sampleWalterReflectionPdf
+#else
 #define specularPdf sampleGGXVNDFReflectionPdf
+#endif
 #else
 #define specularSampleWeight specularSampleWeightBeckmannWalter
-#define specularPdf sampleBeckmannWalterReflectionPdf
+#define specularPdf sampleWalterReflectionPdf
 #endif
 
 #if DIFFUSE_BRDF == LAMBERTIAN
@@ -198,6 +226,7 @@ struct MaterialProperties
 	float roughness;
 
 	float transmissivness;
+	float reflectance;		//< This should default to 0.5 to set minimal reflectance at 4%
 	float opacity;
 };
 
@@ -240,55 +269,60 @@ struct BrdfData
 
 // Converts Phong's exponent (shininess) to Beckmann roughness (alpha)
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
-float shininessToBeckmannAlpha(float shininess) {
+FUNCTION float shininessToBeckmannAlpha(float shininess) {
 	return sqrt(2.0f / (shininess + 2.0f));
 }
 
 // Converts Beckmann roughness (alpha) to Phong's exponent (shininess)
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
-float beckmannAlphaToShininess(float alpha) {
+FUNCTION float beckmannAlphaToShininess(float alpha) {
 	return 2.0f / min(0.9999f, max(0.0002f, (alpha * alpha))) - 2.0f;
 }
 
 // Converts Beckmann roughness (alpha) to Oren-Nayar roughness (sigma)
 // Source: "Moving Frostbite to Physically Based Rendering" by Lagarde & de Rousiers
-float beckmannAlphaToOrenNayarRoughness(float alpha) {
+FUNCTION float beckmannAlphaToOrenNayarRoughness(float alpha) {
 	return 0.7071067f * atan(alpha);
 }
 
-float luminance(float3 rgb)
+FUNCTION float luminance(float3 rgb)
 {
 	return dot(rgb, float3(0.2126f, 0.7152f, 0.0722f));
 }
 
-float3 baseColorToSpecularF0(float3 baseColor, float metalness) {
-	return lerp(float3(MIN_DIELECTRICS_F0, MIN_DIELECTRICS_F0, MIN_DIELECTRICS_F0), baseColor, metalness);
+FUNCTION float3 baseColorToSpecularF0(const float3 baseColor, const float metalness, const float reflectance = 0.5f) {
+#if USE_REFLECTANCE_PARAMETER
+	const float minDielectricsF0 = 0.16f * reflectance * reflectance;
+#else
+	const float minDielectricsF0 = MIN_DIELECTRICS_F0;
+#endif
+	return lerp(float3(minDielectricsF0, minDielectricsF0, minDielectricsF0), baseColor, metalness);
 }
 
-float3 baseColorToDiffuseReflectance(float3 baseColor, float metalness)
+FUNCTION float3 baseColorToDiffuseReflectance(float3 baseColor, float metalness)
 {
 	return baseColor * (1.0f - metalness);
 }
 
-float none(const BrdfData data) {
+FUNCTION float none(const BrdfData data) {
 	return 0.0f;
 }
 
-float3 evalVoid(const BrdfData data) {
+FUNCTION float3 evalVoid(const BrdfData data) {
 	return float3(0.0f, 0.0f, 0.0f);
 }
 
-void evalIndirectVoid(const BrdfData data, float2 u, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) weight) {
+FUNCTION void evalIndirectVoid(const BrdfData data, float2 u, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) weight) {
 	rayDirection = float3(0.0f, 0.0f, 1.0f);
 	weight = float3(0.0f, 0.0f, 0.0f);
 }
 
-float3 sampleSpecularVoid(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
+FUNCTION float3 sampleSpecularVoid(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
 	weight = float3(0.0f, 0.0f, 0.0f);
 	return float3(0.0f, 0.0f, 0.0f);
 }
 
-float3 sampleSpecularHalfVectorVoid(float3 Vlocal, float2 alpha2D, float2 u) {
+FUNCTION float3 sampleSpecularHalfVectorVoid(float3 Vlocal, float2 alpha2D, float2 u) {
 	return float3(0.0f, 0.0f, 0.0f);
 }
 
@@ -298,7 +332,7 @@ float3 sampleSpecularHalfVectorVoid(float3 Vlocal, float2 alpha2D, float2 u) {
 
 // Calculates rotation quaternion from input vector to the vector (0, 0, 1)
 // Input vector must be normalized!
-float4 getRotationToZAxis(float3 input) {
+FUNCTION float4 getRotationToZAxis(float3 input) {
 
 	// Handle special case when input is exact or near opposite of (0, 0, 1)
 	if (input.z < -0.99999f) return float4(1.0f, 0.0f, 0.0f, 0.0f);
@@ -308,7 +342,7 @@ float4 getRotationToZAxis(float3 input) {
 
 // Calculates rotation quaternion from vector (0, 0, 1) to the input vector
 // Input vector must be normalized!
-float4 getRotationFromZAxis(float3 input) {
+FUNCTION float4 getRotationFromZAxis(float3 input) {
 
 	// Handle special case when input is exact or near opposite of (0, 0, 1)
 	if (input.z < -0.99999f) return float4(1.0f, 0.0f, 0.0f, 0.0f);
@@ -317,14 +351,14 @@ float4 getRotationFromZAxis(float3 input) {
 }
 
 // Returns the quaternion with inverted rotation
-float4 invertRotation(float4 q)
+FUNCTION float4 invertRotation(float4 q)
 {
 	return float4(-q.x, -q.y, -q.z, q.w);
 }
 
 // Optimized point rotation using quaternion
 // Source: https://gamedev.stackexchange.com/questions/28395/rotating-vector3-by-a-quaternion
-float3 rotatePoint(float4 q, float3 v) {
+FUNCTION float3 rotatePoint(float4 q, float3 v) {
 	const float3 qAxis = float3(q.x, q.y, q.z);
 	return 2.0f * dot(qAxis, v) * qAxis + (q.w * q.w - dot(qAxis, qAxis)) * v + 2.0f * q.w * cross(qAxis, v);
 }
@@ -335,7 +369,7 @@ float3 rotatePoint(float4 q, float3 v) {
 
 // Samples a direction within a hemisphere oriented along +Z axis with a cosine-weighted distribution 
 // Source: "Sampling Transformations Zoo" in Ray Tracing Gems by Shirley et al.
-float3 sampleHemisphere(float2 u, OUT_PARAMETER(float) pdf) {
+FUNCTION float3 sampleHemisphere(float2 u, OUT_PARAMETER(float) pdf) {
 
 	float a = sqrt(u.x);
 	float b = TWO_PI * u.y;
@@ -350,13 +384,13 @@ float3 sampleHemisphere(float2 u, OUT_PARAMETER(float) pdf) {
 	return result;
 }
 
-float3 sampleHemisphere(float2 u) {
+FUNCTION float3 sampleHemisphere(float2 u) {
 	float pdf;
 	return sampleHemisphere(u, pdf);
 }
 
 // For sampling of all our diffuse BRDFs we use cosine-weighted hemisphere sampling, with PDF equal to (NdotL/PI)
-float diffusePdf(float NdotL) {
+FUNCTION float diffusePdf(float NdotL) {
 	return NdotL * ONE_OVER_PI;
 }
 
@@ -366,14 +400,14 @@ float diffusePdf(float NdotL) {
 
 // Schlick's approximation to Fresnel term
 // f90 should be 1.0, except for the trick used by Schuler (see 'shadowedF90' function)
-float3 evalFresnelSchlick(float3 f0, float f90, float NdotS)
+FUNCTION float3 evalFresnelSchlick(float3 f0, float f90, float NdotS)
 {
 	return f0 + (f90 - f0) * pow(1.0f - NdotS, 5.0f);
 }
 
 // Schlick's approximation to Fresnel term calculated using spherical gaussian approximation
 // Source: https://seblagarde.wordpress.com/2012/06/03/spherical-gaussien-approximation-for-blinn-phong-phong-and-fresnel/ by Lagarde
-float3 evalFresnelSchlickSphericalGaussian(float3 f0, float f90, float NdotV)
+FUNCTION float3 evalFresnelSchlickSphericalGaussian(float3 f0, float f90, float NdotV)
 {
 	return f0 + (f90 - f0) * exp2((-5.55473f * NdotV - 6.983146f) * NdotV);
 }
@@ -381,14 +415,14 @@ float3 evalFresnelSchlickSphericalGaussian(float3 f0, float f90, float NdotV)
 // Schlick's approximation to Fresnel term with Hoffman's improvement using the Lazanyi's error term
 // Source: "Fresnel Equations Considered Harmful" by Hoffman
 // Also see slides http://renderwonk.com/publications/mam2019/naty_mam2019.pdf for examples and explanation of f82 term
-float3 evalFresnelHoffman(float3 f0, float f82, float f90, float NdotS)
+FUNCTION float3 evalFresnelHoffman(float3 f0, float f82, float f90, float NdotS)
 {
 	const float alpha = 6.0f; //< Fixed to 6 in order to put peak angle for Lazanyi's error term at 82 degrees (f82)
 	float3 a = 17.6513846f * (f0 - f82) + 8.166666f * (float3(1.0f, 1.0f, 1.0f) - f0);
 	return saturate(f0 + (f90 - f0) * pow(1.0f - NdotS, 5.0f) - a * NdotS * pow(1.0f - NdotS, alpha));
 }
 
-float3 evalFresnel(float3 f0, float f90, float NdotS)
+FUNCTION float3 evalFresnel(float3 f0, float f90, float NdotS)
 {
 	// Default is Schlick's approximation
 	return evalFresnelSchlick(f0, f90, NdotS);
@@ -399,7 +433,7 @@ float3 evalFresnel(float3 f0, float f90, float NdotS)
 // Also see section "Overbright highlights" in Hoffman's 2010 "Crafting Physically Motivated Shading Models for Game Development" for discussion
 // IMPORTANT: Note that when F0 is calculated using metalness, it's value is never less than MIN_DIELECTRICS_F0, and therefore,
 // this adjustment has no effect. To be effective, F0 must be authored separately, or calculated in different way. See main text for discussion.
-float shadowedF90(float3 F0) {
+FUNCTION float shadowedF90(float3 F0) {
 	// This scaler value is somewhat arbitrary, Schuler used 60 in his article. In here, we derive it from MIN_DIELECTRICS_F0 so
 	// that it takes effect for any reflectance lower than least reflective dielectrics
 	//const float t = 60.0f;
@@ -411,11 +445,11 @@ float shadowedF90(float3 F0) {
 //    Lambert
 // -------------------------------------------------------------------------
 
-float lambertian(const BrdfData data) {
+FUNCTION float lambertian(const BrdfData data) {
 	return 1.0f;
 }
 
-float3 evalLambertian(const BrdfData data) {
+FUNCTION float3 evalLambertian(const BrdfData data) {
 	return data.diffuseReflectance * (ONE_OVER_PI * data.NdotL);
 }
 
@@ -424,12 +458,12 @@ float3 evalLambertian(const BrdfData data) {
 // -------------------------------------------------------------------------
 
 // For derivation see "Phong Normalization Factor derivation" by Giesen
-float phongNormalizationTerm(float shininess) {
+FUNCTION float phongNormalizationTerm(float shininess) {
 
 	return (1.0f + shininess) * ONE_OVER_TWO_PI;
 }
 
-float3 evalPhong(const BrdfData data) {
+FUNCTION float3 evalPhong(const BrdfData data) {
 
 	// First convert roughness to shininess (Phong exponent)
 	float shininess = beckmannAlphaToShininess(data.alpha);
@@ -440,7 +474,7 @@ float3 evalPhong(const BrdfData data) {
 
 // Samples a Phong distribution lobe oriented along +Z axis
 // Source: "Sampling Transformations Zoo" in Ray Tracing Gems by Shirley et al.
-float3 samplePhong(float3 Vlocal, float shininess, float2 u, OUT_PARAMETER(float) pdf) {
+FUNCTION float3 samplePhong(float3 Vlocal, float shininess, float2 u, OUT_PARAMETER(float) pdf) {
 
 	float cosTheta = pow(1.0f - u.x, 1.0f / (1.0f + shininess));
 	float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
@@ -455,14 +489,14 @@ float3 samplePhong(float3 Vlocal, float shininess, float2 u, OUT_PARAMETER(float
 		cosTheta);
 }
 
-float3 samplePhong(float3 Vlocal, float2 alpha2D, float2 u) {
+FUNCTION float3 samplePhong(float3 Vlocal, float2 alpha2D, float2 u) {
 	float shininess = beckmannAlphaToShininess(dot(alpha2D, float2(0.5f, 0.5f)));
 	float pdf;
 	return samplePhong(Vlocal, shininess, u, pdf);
 }
 
 // Sampling the specular BRDF based on Phong, includes normalization term
-float3 sampleSpecularPhong(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
+FUNCTION float3 sampleSpecularPhong(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
 
 	// First convert roughness to shininess (Phong exponent)
 	float shininess = beckmannAlphaToShininess(alpha);
@@ -493,7 +527,7 @@ float3 sampleSpecularPhong(float3 Vlocal, float alpha, float alphaSquared, float
 
 // Based on Oren-Nayar's qualitative model
 // Source: "Generalization of Lambert's Reflectance Model" by Oren & Nayar
-float orenNayar(BrdfData data) {
+FUNCTION float orenNayar(BrdfData data) {
 
 	// Oren-Nayar roughness (sigma) is in radians - use conversion from Beckmann roughness here
 	float sigma = beckmannAlphaToOrenNayarRoughness(data.alpha);
@@ -516,7 +550,7 @@ float orenNayar(BrdfData data) {
 	return (A + B * max(0.0f, cosPhiDifference) * sin(alpha) * tan(beta));
 }
 
-float3 evalOrenNayar(const BrdfData data) {
+FUNCTION float3 evalOrenNayar(const BrdfData data) {
 	return data.diffuseReflectance * (orenNayar(data) * ONE_OVER_PI * data.NdotL);
 }
 
@@ -526,7 +560,7 @@ float3 evalOrenNayar(const BrdfData data) {
 
 // Disney's diffuse term
 // Source "Physically-Based Shading at Disney" by Burley
-float disneyDiffuse(const BrdfData data) {
+FUNCTION float disneyDiffuse(const BrdfData data) {
 
 	float FD90MinusOne = 2.0f * data.roughness * data.LdotH * data.LdotH - 0.5f;
 
@@ -536,13 +570,13 @@ float disneyDiffuse(const BrdfData data) {
 	return FDL * FDV;
 }
 
-float3 evalDisneyDiffuse(const BrdfData data) {
+FUNCTION float3 evalDisneyDiffuse(const BrdfData data) {
 	return data.diffuseReflectance * (disneyDiffuse(data) * ONE_OVER_PI * data.NdotL);
 }
 
 // Frostbite's version of Disney diffuse with energy normalization.
 // Source: "Moving Frostbite to Physically Based Rendering" by Lagarde & de Rousiers
-float frostbiteDisneyDiffuse(const BrdfData data) {
+FUNCTION float frostbiteDisneyDiffuse(const BrdfData data) {
 	float energyBias = 0.5f * data.roughness;
 	float energyFactor = lerp(1.0f, 1.0f / 1.51f, data.roughness);
 
@@ -554,7 +588,7 @@ float frostbiteDisneyDiffuse(const BrdfData data) {
 	return FDL * FDV * energyFactor;
 }
 
-float3 evalFrostbiteDisneyDiffuse(const BrdfData data) {
+FUNCTION float3 evalFrostbiteDisneyDiffuse(const BrdfData data) {
 	return data.diffuseReflectance * (frostbiteDisneyDiffuse(data) * ONE_OVER_PI * data.NdotL);
 }
 
@@ -565,12 +599,12 @@ float3 evalFrostbiteDisneyDiffuse(const BrdfData data) {
 // Function to calculate 'a' parameter for lambda functions needed in Smith G term
 // This is a version for shape invariant (isotropic) NDFs
 // Note: makse sure NdotS is not negative
-float Smith_G_a(float alpha, float NdotS) {
+FUNCTION float Smith_G_a(float alpha, float NdotS) {
 	return NdotS / (max(0.00001f, alpha) * sqrt(1.0f - min(0.99999f, NdotS * NdotS)));
 }
 
 // Lambda function for Smith G term derived for GGX distribution
-float Smith_G_Lambda_GGX(float a) {
+FUNCTION float Smith_G_Lambda_GGX(float a) {
 	return (-1.0f + sqrt(1.0f + (1.0f / (a * a)))) * 0.5f;
 }
 
@@ -578,7 +612,7 @@ float Smith_G_Lambda_GGX(float a) {
 // This is Walter's rational approximation (avoids evaluating of error function)
 // Source: "Real-time Rendering", 4th edition, p.339 by Akenine-Moller et al.
 // Note that this formulation is slightly optimized and different from Walter's
-float Smith_G_Lambda_Beckmann_Walter(float a) {
+FUNCTION float Smith_G_Lambda_Beckmann_Walter(float a) {
 	if (a < 1.6f) {
 		return (1.0f - (1.259f - 0.396f * a) * a) / ((3.535f + 2.181f * a) * a);
 		//return ((1.0f + (2.276f + 2.577f * a) * a) / ((3.535f + 2.181f * a) * a)) - 1.0f; //< Walter's original
@@ -589,24 +623,24 @@ float Smith_G_Lambda_Beckmann_Walter(float a) {
 
 // Smith G1 term (masking function)
 // This non-optimized version uses NDF specific lambda function (G_Lambda) resolved bia macro based on selected NDF
-float Smith_G1_General(float a) {
+FUNCTION float Smith_G1_General(float a) {
 	return 1.0f / (1.0f + Smith_G_Lambda(a));
 }
 
 // Smith G1 term (masking function) optimized for GGX distribution (by substituting G_Lambda_GGX into G1)
-float Smith_G1_GGX(float a) {
+FUNCTION float Smith_G1_GGX(float a) {
 	float a2 = a * a;
 	return 2.0f / (sqrt((a2 + 1.0f) / a2) + 1.0f);
 }
 
 // Smith G1 term (masking function) further optimized for GGX distribution (by substituting G_a into G1_GGX)
-float Smith_G1_GGX(float alpha, float NdotS, float alphaSquared, float NdotSSquared) {
+FUNCTION float Smith_G1_GGX(float alpha, float NdotS, float alphaSquared, float NdotSSquared) {
 	return 2.0f / (sqrt(((alphaSquared * (1.0f - NdotSSquared)) + NdotSSquared) / NdotSSquared) + 1.0f);
 }
 
 // Smith G1 term (masking function) optimized for Beckmann distribution (by substituting G_Lambda_Beckmann_Walter into G1)
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
-float Smith_G1_Beckmann_Walter(float a) {
+FUNCTION float Smith_G1_Beckmann_Walter(float a) {
 	if (a < 1.6f) {
 		return ((3.535f + 2.181f * a) * a) / (1.0f + (2.276f + 2.577f * a) * a);
 	} else {
@@ -614,13 +648,13 @@ float Smith_G1_Beckmann_Walter(float a) {
 	}
 }
 
-float Smith_G1_Beckmann_Walter(float alpha, float NdotS, float alphaSquared, float NdotSSquared) {
+FUNCTION float Smith_G1_Beckmann_Walter(float alpha, float NdotS, float alphaSquared, float NdotSSquared) {
 	return Smith_G1_Beckmann_Walter(Smith_G_a(alpha, NdotS));
 }
 
 // Smith G2 term (masking-shadowing function)
 // Separable version assuming independent (uncorrelated) masking and shadowing, uses G1 functions for selected NDF
-float Smith_G2_Separable(float alpha, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Separable(float alpha, float NdotL, float NdotV) {
 	float aL = Smith_G_a(alpha, NdotL);
 	float aV = Smith_G_a(alpha, NdotV);
 	return Smith_G1(aL) * Smith_G1(aV);
@@ -628,7 +662,7 @@ float Smith_G2_Separable(float alpha, float NdotL, float NdotV) {
 
 // Smith G2 term (masking-shadowing function)
 // Height correlated version - non-optimized, uses G_Lambda functions for selected NDF
-float Smith_G2_Height_Correlated(float alpha, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Height_Correlated(float alpha, float NdotL, float NdotV) {
 	float aL = Smith_G_a(alpha, NdotL);
 	float aV = Smith_G_a(alpha, NdotV);
 	return 1.0f / (1.0f + Smith_G_Lambda(aL) + Smith_G_Lambda(aV));
@@ -639,7 +673,7 @@ float Smith_G2_Height_Correlated(float alpha, float NdotL, float NdotV) {
 // dividing by (4 * NdotL * NdotV) to cancel out these terms in specular BRDF denominator
 // Source: "Moving Frostbite to Physically Based Rendering" by Lagarde & de Rousiers
 // Note that returned value is G2 / (4 * NdotL * NdotV) and therefore includes division by specular BRDF denominator
-float Smith_G2_Separable_GGX_Lagarde(float alphaSquared, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Separable_GGX_Lagarde(float alphaSquared, float NdotL, float NdotV) {
 	float a = NdotV + sqrt(alphaSquared + NdotV * (NdotV - alphaSquared * NdotV));
 	float b = NdotL + sqrt(alphaSquared + NdotL * (NdotL - alphaSquared * NdotL));
 	return 1.0f / (a * b);
@@ -650,7 +684,7 @@ float Smith_G2_Separable_GGX_Lagarde(float alphaSquared, float NdotL, float Ndot
 // the terms in specular BRDF denominator
 // Source: "Moving Frostbite to Physically Based Rendering" by Lagarde & de Rousiers
 // Note that returned value is G2 / (4 * NdotL * NdotV) and therefore includes division by specular BRDF denominator
-float Smith_G2_Height_Correlated_GGX_Lagarde(float alphaSquared, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Height_Correlated_GGX_Lagarde(float alphaSquared, float NdotL, float NdotV) {
 	float a = NdotV * sqrt(alphaSquared + NdotL * (NdotL - alphaSquared * NdotL));
 	float b = NdotL * sqrt(alphaSquared + NdotV * (NdotV - alphaSquared * NdotV));
 	return 0.5f / (a + b);
@@ -660,13 +694,13 @@ float Smith_G2_Height_Correlated_GGX_Lagarde(float alphaSquared, float NdotL, fl
 // Height correlated version - approximation by Hammon
 // Source: "PBR Diffuse Lighting for GGX + Smith Microsurfaces", slide 84 by Hammon
 // Note that returned value is G2 / (4 * NdotL * NdotV) and therefore includes division by specular BRDF denominator
-float Smith_G2_Height_Correlated_GGX_Hammon(float alpha, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Height_Correlated_GGX_Hammon(float alpha, float NdotL, float NdotV) {
 	return 0.5f / (lerp(2.0f * NdotL * NdotV, NdotL + NdotV, alpha));
 }
 
 // A fraction G2/G1 where G2 is height correlated can be expressed using only G1 terms
 // Source: "Implementing a Simple Anisotropic Rough Diffuse Material with Stochastic Evaluation", Appendix A by Heitz & Dupuy
-float Smith_G2_Over_G1_Height_Correlated(float alpha, float alphaSquared, float NdotL, float NdotV) {
+FUNCTION float Smith_G2_Over_G1_Height_Correlated(float alpha, float alphaSquared, float NdotL, float NdotV) {
 	float G1V = Smith_G1(alpha, NdotV, alphaSquared, NdotV * NdotV);
 	float G1L = Smith_G1(alpha, NdotL, alphaSquared, NdotL * NdotL);
 	return G1L / (G1V + G1L - G1V * G1L);
@@ -675,7 +709,7 @@ float Smith_G2_Over_G1_Height_Correlated(float alpha, float alphaSquared, float 
 // Evaluates G2 for selected configuration (GGX/Beckmann, optimized/non-optimized, separable/height-correlated)
 // Note that some paths aren't optimized too much...
 // Also note that when USE_OPTIMIZED_G2 is specified, returned value will be: G2 / (4 * NdotL * NdotV) if GG-X is selected
-float Smith_G2(float alpha, float alphaSquared, float NdotL, float NdotV) {
+FUNCTION float Smith_G2(float alpha, float alphaSquared, float NdotL, float NdotV) {
 
 #if USE_OPTIMIZED_G2 && (MICROFACET_DISTRIBUTION == GGX)
 #if USE_HEIGHT_CORRELATED_G2
@@ -699,7 +733,7 @@ float Smith_G2(float alpha, float alphaSquared, float NdotL, float NdotV) {
 //    Normal distribution functions
 // -------------------------------------------------------------------------
 
-float Beckmann_D(float alphaSquared, float NdotH)
+FUNCTION float Beckmann_D(float alphaSquared, float NdotH)
 {
 	float cos2Theta = NdotH * NdotH;
 	float numerator = exp((cos2Theta - 1.0f) / (alphaSquared * cos2Theta));
@@ -707,7 +741,7 @@ float Beckmann_D(float alphaSquared, float NdotH)
 	return numerator / denominator;
 }
 
-float GGX_D(float alphaSquared, float NdotH) {
+FUNCTION float GGX_D(float alphaSquared, float NdotH) {
 	float b = ((alphaSquared - 1.0f) * NdotH * NdotH + 1.0f);
 	return alphaSquared / (PI * b * b);
 }
@@ -718,13 +752,32 @@ float GGX_D(float alphaSquared, float NdotH) {
 
 // Samples a microfacet normal for the GGX distribution using VNDF method.
 // Source: "Sampling the GGX Distribution of Visible Normals" by Heitz
-// See also https://hal.inria.fr/hal-00996995v1/document and http://jcgt.org/published/0007/04/01/
+// Source: "Sampling Visible GGX Normals with Spherical Caps" by Dupuy & Benyoub
 // Random variables 'u' must be in <0;1) interval
 // PDF is 'G1(NdotV) * D'
-float3 sampleGGXVNDF(float3 Ve, float2 alpha2D, float2 u) {
+FUNCTION float3 sampleGGXVNDF(float3 Ve, float2 alpha2D, float2 u) {
 
 	// Section 3.2: transforming the view direction to the hemisphere configuration
 	float3 Vh = normalize(float3(alpha2D.x * Ve.x, alpha2D.y * Ve.y, Ve.z));
+
+#if USE_VNDF_WITH_SPHERICAL_CAPS
+
+	// Source: "Sampling Visible GGX Normals with Spherical Caps" by Dupuy & Benyoub
+
+	// Sample a spherical cap in (-Vh.z, 1]
+	float phi = 2.0f * PI * u.x;
+	float z = ((1.0f - u.y) * (1.0f + Vh.z)) - Vh.z;
+	float sinTheta = sqrt(clamp(1.0f - z * z, 0.0f, 1.0f));
+	float x = sinTheta * cos(phi);
+	float y = sinTheta * sin(phi);
+
+	// compute halfway direction;
+	float3 Nh = float3(x, y, z) + Vh;
+
+#else
+
+	// Source: "Sampling the GGX Distribution of Visible Normals" by Heitz
+	// See also https://hal.inria.fr/hal-00996995v1/document and http://jcgt.org/published/0007/04/01/
 
 	// Section 4.1: orthonormal basis (with special case if cross product is zero)
 	float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
@@ -742,6 +795,8 @@ float3 sampleGGXVNDF(float3 Ve, float2 alpha2D, float2 u) {
 	// Section 4.3: reprojection onto hemisphere
 	float3 Nh = t1 * T1 + t2 * T2 + sqrt(max(0.0f, 1.0f - t1 * t1 - t2 * t2)) * Vh;
 
+#endif
+
 	// Section 3.4: transforming the normal back to the ellipsoid configuration
 	return normalize(float3(alpha2D.x * Nh.x, alpha2D.y * Nh.y, max(0.0f, Nh.z)));
 }
@@ -749,7 +804,7 @@ float3 sampleGGXVNDF(float3 Ve, float2 alpha2D, float2 u) {
 // PDF of sampling a reflection vector L using 'sampleGGXVNDF'.
 // Note that PDF of sampling given microfacet normal is (G1 * D) when vectors are in local space (in the hemisphere around shading normal). 
 // Remaining terms (1.0f / (4.0f * NdotV)) are specific for reflection case, and come from multiplying PDF by jacobian of reflection operator
-float sampleGGXVNDFReflectionPdf(float alpha, float alphaSquared, float NdotH, float NdotV, float LdotH) {
+FUNCTION float sampleGGXVNDFReflectionPdf(float alpha, float alphaSquared, float NdotH, float NdotV, float LdotH) {
 	NdotH = max(0.00001f, NdotH);
 	NdotV = max(0.00001f, NdotV);
 	return (GGX_D(max(0.00001f, alphaSquared), NdotH) * Smith_G1_GGX(alpha, NdotV, alphaSquared, NdotV * NdotV)) / (4.0f * NdotV);
@@ -757,29 +812,29 @@ float sampleGGXVNDFReflectionPdf(float alpha, float alphaSquared, float NdotH, f
 
 // "Walter's trick" is an adjustment of alpha value for Walter's sampling to reduce maximal weight of sample to about 4
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al., page 8
-float waltersTrick(float alpha, float NdotV) {
+FUNCTION float waltersTrick(float alpha, float NdotV) {
 	return (1.2f - 0.2f * sqrt(abs(NdotV))) * alpha;
 }
 
-// PDF of sampling a reflection vector L using 'sampleBeckmannWalter'.
+// PDF of sampling a reflection vector L using 'sampleBeckmannWalter' or 'sampleGGXWalter'.
 // Note that PDF of sampling given microfacet normal is (D * NdotH). Remaining terms (1.0f / (4.0f * LdotH)) are specific for
 // reflection case, and come from multiplying PDF by jacobian of reflection operator
-float sampleBeckmannWalterReflectionPdf(float alpha, float alphaSquared, float NdotH, float NdotV, float LdotH) {
+FUNCTION float sampleWalterReflectionPdf(float alpha, float alphaSquared, float NdotH, float NdotV, float LdotH) {
 	NdotH = max(0.00001f, NdotH);
 	LdotH = max(0.00001f, LdotH);
-	return Beckmann_D(max(0.00001f, alphaSquared), NdotH) * NdotH / (4.0f * LdotH);
+	return Microfacet_D(max(0.00001f, alphaSquared), NdotH) * NdotH / (4.0f * LdotH);
 }
 
 // Samples a microfacet normal for the Beckmann distribution using walter's method.
 // Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
 // PDF is 'D * NdotH'
-float3 sampleBeckmannWalter(float3 Vlocal, float2 alpha2D, float2 u) {
+FUNCTION float3 sampleBeckmannWalter(float3 Vlocal, float2 alpha2D, float2 u) {
 	float alpha = dot(alpha2D, float2(0.5f, 0.5f));
 
 	// Equations (28) and (29) from Walter's paper for Beckmann distribution
 	float tanThetaSquared = -(alpha * alpha) * log(1.0f - u.x);
 	float phi = TWO_PI * u.y;
-	
+
 	// Calculate cosTheta and sinTheta needed for conversion to H vector
 	float cosTheta = rsqrt(1.0f + tanThetaSquared);
 	float sinTheta = sqrt(1.0f - cosTheta * cosTheta);
@@ -788,8 +843,25 @@ float3 sampleBeckmannWalter(float3 Vlocal, float2 alpha2D, float2 u) {
 	return normalize(float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
 }
 
+// Samples a microfacet normal for the GG-X distribution using walter's method.
+// Source: "Microfacet Models for Refraction through Rough Surfaces" by Walter et al.
+// PDF is 'D * NdotH'
+FUNCTION float3 sampleGGXWalter(float3 Vlocal, float2 alpha2D, float2 u) {
+	float alpha = dot(alpha2D, float2(0.5f, 0.5f));
+	float alphaSquared = alpha * alpha;
+
+	// Calculate cosTheta and sinTheta needed for conversion to H vector
+	float cosThetaSquared = (1.0f - u.x) / ((alphaSquared - 1.0f) * u.x + 1.0f);
+	float cosTheta = sqrt(cosThetaSquared);
+	float sinTheta = sqrt(1.0f - cosThetaSquared);
+	float phi = TWO_PI * u.y;
+
+	// Convert sampled spherical coordinates to H vector
+	return normalize(float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta));
+}
+
 // Weight for the reflection ray sampled from GGX distribution using VNDF method
-float specularSampleWeightGGXVNDF(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
+FUNCTION float specularSampleWeightGGXVNDF(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
 #if USE_HEIGHT_CORRELATED_G2
 	return Smith_G2_Over_G1_Height_Correlated(alpha, alphaSquared, NdotL, NdotV);
 #else 
@@ -798,13 +870,22 @@ float specularSampleWeightGGXVNDF(float alpha, float alphaSquared, float NdotL, 
 }
 
 // Weight for the reflection ray sampled from Beckmann distribution using Walter's method
-float specularSampleWeightBeckmannWalter(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
+FUNCTION float specularSampleWeightBeckmannWalter(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
 	return (HdotL * Smith_G2(alpha, alphaSquared, NdotL, NdotV)) / (NdotV * NdotH);
+}
+
+// Weight for the reflection ray sampled from GGX distribution using Walter's method
+FUNCTION float specularSampleWeightGGXWalter(float alpha, float alphaSquared, float NdotL, float NdotV, float HdotL, float NdotH) {
+#if USE_OPTIMIZED_G2 
+	return (NdotL * HdotL * Smith_G2(alpha, alphaSquared, NdotL, NdotV) * 4.0f) / NdotH;
+#else
+	return (HdotL * Smith_G2(alpha, alphaSquared, NdotL, NdotV)) / (NdotV * NdotH);
+#endif
 }
 
 // Samples a reflection ray from the rough surface using selected microfacet distribution and sampling method
 // Resulting weight includes multiplication by cosine (NdotL) term
-float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
+FUNCTION float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, float3 specularF0, float2 u, OUT_PARAMETER(float3) weight) {
 
 	// Sample a microfacet normal (H) in local space
 	float3 Hlocal;
@@ -836,7 +917,7 @@ float3 sampleSpecularMicrofacet(float3 Vlocal, float alpha, float alphaSquared, 
 }
 
 // Evaluates microfacet specular BRDF
-float3 evalMicrofacet(const BrdfData data) {
+FUNCTION float3 evalMicrofacet(const BrdfData data) {
 
 	float D = Microfacet_D(max(0.00001f, data.alphaSquared), data.NdotH);
 	float G2 = Smith_G2(data.alpha, data.alphaSquared, data.NdotL, data.NdotV);
@@ -856,7 +937,7 @@ float3 evalMicrofacet(const BrdfData data) {
 // Precalculates commonly used terms in BRDF evaluation
 // Clamps around dot products prevent NaNs and ensure numerical stability, but make sure to
 // correctly ignore rays outside of the sampling hemisphere, by using 'Vbackfacing' and 'Lbackfacing' flags
-BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties material) {
+FUNCTION BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties material) {
 	BrdfData data;
 
 	// Evaluate VNHL vectors
@@ -879,7 +960,7 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 	data.VdotH = saturate(dot(V, data.H));
 
 	// Unpack material properties
-	data.specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness);
+	data.specularF0 = baseColorToSpecularF0(material.baseColor, material.metalness, material.reflectance);
 	data.diffuseReflectance = baseColorToDiffuseReflectance(material.baseColor, material.metalness);
 
 	// Unpack 'perceptively linear' -> 'linear' -> 'squared' roughness
@@ -894,7 +975,7 @@ BrdfData prepareBRDFData(float3 N, float3 L, float3 V, MaterialProperties materi
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for direct light)
-float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties material) {
+FUNCTION float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties material) {
 
 	// Prepare data needed for BRDF evaluation - unpack material properties and evaluate commonly used terms (e.g. Fresnel, NdotL, ...)
 	const BrdfData data = prepareBRDFData(N, L, V, material);
@@ -916,7 +997,7 @@ float3 evalCombinedBRDF(float3 N, float3 L, float3 V, MaterialProperties materia
 }
 
 // This is an entry point for evaluation of all other BRDFs based on selected configuration (for indirect light)
-bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight) {
+FUNCTION bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNormal, float3 V, MaterialProperties material, const int brdfType, OUT_PARAMETER(float3) rayDirection, OUT_PARAMETER(float3) sampleWeight) {
 
 	// Ignore incident ray coming from "below" the hemisphere
 	if (dot(shadingNormal, V) <= 0.0f) return false;
@@ -930,7 +1011,7 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 	float3 rayDirectionLocal = float3(0.0f, 0.0f, 0.0f);
 
 	if (brdfType == DIFFUSE_TYPE) {
-		
+
 		// Sample diffuse ray using cosine-weighted hemisphere sampling 
 		rayDirectionLocal = sampleHemisphere(u);
 		const BrdfData data = prepareBRDFData(Nlocal, rayDirectionLocal, Vlocal, material);
@@ -942,9 +1023,21 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 		// Sample a half-vector of specular BRDF. Note that we're reusing random variable 'u' here, but correctly it should be an new independent random number
 		float3 Hspecular = sampleSpecularHalfVector(Vlocal, float2(data.alpha, data.alpha), u);
 
+#if USE_WALTER_GGX_SAMPLING
+		// Check if specular sample is valid (does not reflect under the hemisphere)
+		float VdotH = dot(Vlocal, Hspecular);
+		if (VdotH > 0.00001f)
+		{
+			sampleWeight *= (float3(1.0f, 1.0f, 1.0f) - evalFresnel(data.specularF0, shadowedF90(data.specularF0), min(1.0f, VdotH)));
+		} else {
+			return false;
+		}
+#else
 		// Clamp HdotL to small value to prevent numerical instability. Assume that rays incident from below the hemisphere have been filtered
+		// Note: VdotH is always positive for VNDF sampling so we don't need to test if it's positive like we do for sampling with Walter's method
 		float VdotH = max(0.00001f, min(1.0f, dot(Vlocal, Hspecular)));
 		sampleWeight *= (float3(1.0f, 1.0f, 1.0f) - evalFresnel(data.specularF0, shadowedF90(data.specularF0), VdotH));
+#endif
 #endif
 
 	} else if (brdfType == SPECULAR_TYPE) {
@@ -963,3 +1056,79 @@ bool evalIndirectCombinedBRDF(float2 u, float3 shadingNormal, float3 geometryNor
 
 	return true;
 }
+
+// Approximates the directional-hemispherical reflectance of the micriofacet specular BRDF with GG-X distribution
+// Source: "Accurate Real-Time Specular Reflections with Radiance Caching" in Ray Tracing Gems by Hirvonen et al.
+FUNCTION float3 specularGGXReflectanceApprox(float3 specularF0, float alpha, float NdotV)
+{
+#if USE_HEIGHT_CORRELATED_G2
+	const float2x2 A = float2x2(
+		0.995367f, -1.38839f,
+		-0.24751f, 1.97442f
+	);
+
+	const float3x3 B = float3x3(
+		1.0f, 2.68132f, 52.366f,
+		16.0932f, -3.98452f, 59.3013f,
+		-5.18731f, 255.259f, 2544.07f
+	);
+
+	const float2x2 C = float2x2(
+		-0.0564526f, 3.82901f,
+		16.91f, -11.0303f
+	);
+
+	const float3x3 D = float3x3(
+		1.0f, 4.11118f, -1.37886f,
+		19.3254f, -28.9947f, 16.9514f,
+		0.545386f, 96.0994f, -79.4492f
+	);
+#else
+	const float2x2 A = float2x2(
+		0.99044f, -1.28514f,
+		1.29678f, -0.755907f
+	);
+
+	const float3x3 B = float3x3(
+		1.0f, 2.92338f, 59.4188f,
+		20.3225f, -27.0302f, 222.592f,
+		121.563f, 626.13f, 316.627f
+	);
+
+	const float2x2 C = float2x2(
+		0.0365463f, 3.32707f,
+		9.0632f, -9.04756f
+	);
+
+	const float3x3 D = float3x3(
+		1.0f, 3.59685f, -1.36772f,
+		9.04401f, -16.3174f, 9.22949f,
+		5.56589f, 19.7886f, -20.2123f
+	);
+#endif
+
+	const float alpha2 = alpha * alpha;
+	const float alpha3 = alpha * alpha2;
+	const float NdotV2 = NdotV * NdotV;
+	const float NdotV3 = NdotV * NdotV2;
+
+	const float E = dot(mul(A, float2(1.0f, NdotV)), float2(1.0f, alpha));
+	const float F = dot(mul(B, float3(1.0f, NdotV, NdotV3)), float3(1.0f, alpha, alpha3));
+
+	const float G = dot(mul(C, float2(1.0f, NdotV)), float2(1.0f, alpha));
+	const float H = dot(mul(D, float3(1.0f, NdotV2, NdotV3)), float3(1.0f, alpha, alpha3));
+
+	// Turn the bias off for near-zero specular 
+	const float biasModifier = saturate(dot(specularF0, float3(0.333333f, 0.333333f, 0.333333f)) * 50.0f);
+
+	const float bias = max(0.0f, (E / F)) * biasModifier;
+	const float scale = max(0.0f, (G / H));
+
+	return float3(bias, bias, bias) + float3(scale, scale, scale) * specularF0;
+}
+
+#if __cplusplus
+
+}; //< namespace brdf
+
+#endif
